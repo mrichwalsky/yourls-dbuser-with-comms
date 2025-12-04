@@ -2,12 +2,11 @@
     "name": "gasmark8/yourls-better-user-management",
     "description": "PHPMailer dependency for Better User Management plugin",
     "require": {
+        "php": ">=8.0",
         "phpmailer/phpmailer": "^6.9"
     },
     "config": {
-        "platform": {
-            "php": "8.1.0"
-        },
+        "platform-check": false,
         "allow-plugins": {
             "*": true
         }
