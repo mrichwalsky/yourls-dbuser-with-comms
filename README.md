@@ -1,15 +1,28 @@
-# Database Users for YOURLS
+# Better User Management for YOURLS
 
-Database Users replaces the static credential array in `user/config.php` with a database-backed user table and a lightweight administration panel. Activate it to keep logins inside YOURLS, grant a password self-service form, and stay compatible with existing hashing schemes.
+This is an enhanced fork of [Database Users for YOURLS](https://github.com/RayHollister/database-users-for-YOURLS) that adds email support, temporary password generation, and forced password resets.
+
+Better User Management replaces the static credential array in `user/config.php` with a database-backed user table and a lightweight administration panel. Activate it to keep logins inside YOURLS, grant a password self-service form, and stay compatible with existing hashing schemes.
+
+## Enhanced Features (Added in This Fork)
+
+- **Email Integration**: Add email addresses to user accounts for notifications
+- **Temporary Password Generation**: Automatically generate secure temporary passwords for new users
+- **Email Notifications**: Send temporary passwords via email using SMTP (requires PHPMailer)
+- **Forced Password Reset**: Require users to reset their password on first login
+- **Password Reset Page**: Dedicated page for first-time password resets
 
 ## Screenshot
 
 ![Database Users plugin screenshot](screenshot-1.png)
 
 ## Features
-- Creates and maintains the `<prefix>user_credentials` table for logins, roles, and timestamps.
+- Creates and maintains the `<prefix>user_credentials` table for logins, roles, email addresses, and timestamps.
 - Imports the legacy `$yourls_user_passwords` array the first time the table is empty, preserving existing admins.
-- Adds a Plugin page (`Plugins → Database Users → User Accounts`) for creating users, resetting passwords, and switching between the built-in `admin` and `user` roles.
+- Adds a Plugin page (`Admin → User Accounts`) for creating users, resetting passwords, and switching between the built-in `admin` and `user` roles.
+- **Email support**: Store and manage email addresses for all users.
+- **Automatic temporary passwords**: New users receive a secure temporary password that is emailed to them.
+- **Forced password reset**: Users must reset their password on first login via a dedicated reset page.
 - Provides a self-service password change form for the currently logged-in account.
 - Normalizes hashes to YOURLS-style `phpass:` values while still accepting `md5:` and plain strings.
 - Populates the `YOURLS_USER_ROLE` constant at login so the rest of your install can respect roles.
@@ -19,6 +32,14 @@ Database Users replaces the static credential array in `user/config.php` with a 
 - YOURLS 1.8 or newer (other versions are untested).
 - Database user able to run `CREATE TABLE` on the YOURLS database.
 - Access to manage YOURLS plugins in the admin dashboard.
+- **PHPMailer** (for email functionality): Install via Composer (`composer require phpmailer/phpmailer`) or manually place in the plugin directory.
+- **SMTP Configuration**: Add the following to your YOURLS `config.php`:
+  ```php
+  define('YOURLS_SMTP_HOST', 'smtp.example.com');
+  define('YOURLS_SMTP_USER', 'your_smtp_username');
+  define('YOURLS_SMTP_PASS', 'your_smtp_password');
+  define('YOURLS_SMTP_PORT', 587); // or 465 for SSL
+  ```
 
 ## Installation
 1. Copy or clone this folder to `user/plugins/db-users`.
@@ -26,9 +47,10 @@ Database Users replaces the static credential array in `user/config.php` with a 
 3. On activation the plugin creates the credential table and, if it is empty, migrates every entry from `$yourls_user_passwords` in `user/config.php`.
 
 ## Usage
-- Open `Plugins → Database Users → User Accounts` to manage credentials.
-- **Create users**: fill in username, password, confirmation, and role; the plugin prevents duplicates and missing values.
-- **Update users**: expand a user row to change role or set a new password. The plugin guards against removing the final administrator.
+- Open `Admin → User Accounts` to manage credentials.
+- **Create users**: fill in username, email address, and role. A temporary password will be automatically generated and emailed to the user.
+- **Update users**: expand a user row to change email, role, or set a new password. The plugin guards against removing the final administrator.
+- **First login**: Users with temporary passwords will be redirected to a password reset page on first login.
 - **Self-service**: the bottom form lets the signed-in user change their own password after validating the current one. Successful changes refresh the session cookie.
 
 ## Programmatic helpers
@@ -39,7 +61,7 @@ Database Users replaces the static credential array in `user/config.php` with a 
 Call `db_users_refresh_credentials_cache()` after programmatic inserts or updates so new credentials are instantly available to YOURLS.
 
 ## Data model
-Records live in `<prefix>user_credentials` with columns for `user_login`, `user_pass`, `user_role`, `created_at`, and `updated_at`. Passwords are stored as YOURLS-compatible `phpass:` hashes unless an `md5:` hash is supplied. Timestamps are updated automatically on create and update actions.
+Records live in `<prefix>user_credentials` with columns for `user_login`, `user_pass`, `user_role`, `email`, `needs_password_reset`, `created_at`, and `updated_at`. Passwords are stored as YOURLS-compatible `phpass:` hashes unless an `md5:` hash is supplied. The `needs_password_reset` flag is set to 1 for new users and cleared after they reset their password. Timestamps are updated automatically on create and update actions.
 
 ## Troubleshooting
 - Enable `YOURLS_DEBUG` to capture log entries written with `yourls_debug_log()` when insert or update operations fail.
@@ -47,4 +69,7 @@ Records live in `<prefix>user_credentials` with columns for `user_login`, `user_
 - Ensure the database account can create tables the first time the plugin activates; otherwise, manually run the schema from `plugin.php`.
 
 ## Credits
-Built and maintained by [Ray Hollister](https://rayhollister.com).
+
+**This Fork**: Enhanced by [Gas Mark 8, Ltd.](https://gasmark8.com)
+
+**Original Plugin**: Built and maintained by [Ray Hollister](https://rayhollister.com). This is a fork of [database-users-for-YOURLS](https://github.com/RayHollister/database-users-for-YOURLS) with additional email and security features.

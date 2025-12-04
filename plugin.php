@@ -1,11 +1,11 @@
 <?php
 /*
-Plugin Name: Database Users for YOURLS
-Plugin URI: https://github.com/RayHollister/database-users-for-YOURLS
-Description: Store YOURLS user credentials in the database and provide management tools.
-Version: 1.2.0
-Author: Ray Hollister
-Author URI: https://rayhollister.com/
+Plugin Name: Better User Management for YouRLs
+Plugin URI: https://github.com/mrichwalsky/yourls-dbuser-with-comms
+Description: Enhanced user management for YOURLS with email support, temporary password generation, and password reset functionality. A fork of https://github.com/RayHollister/database-users-for-YOURLS that adds email notifications and improved security features including temporary password generation and mbanner promoting password reset on first login.
+Version: 2.0.0
+Author: Gas Mark 8, Ltd.
+Author URI: https://gasmark8.com
 */
 
 // No direct access.
@@ -19,6 +19,12 @@ yourls_add_action( 'plugins_loaded', 'db_users_register_pages' );
 yourls_add_action( 'login', 'db_users_handle_login' );
 yourls_add_filter( 'admin_sublinks', 'db_users_move_menu_link' );
 
+// Hook into admin page head to add banner styles
+yourls_add_action( 'html_head', 'db_users_add_banner_styles' );
+
+// Hook into admin page after logo to show banner if needed
+yourls_add_action( 'html_logo', 'db_users_display_password_reset_banner' );
+
 /**
  * Prepare database and credential cache.
  *
@@ -26,6 +32,7 @@ yourls_add_filter( 'admin_sublinks', 'db_users_move_menu_link' );
  */
 function db_users_bootstrap() {
     $created  = db_users_ensure_table_exists();
+    $migrated = db_users_migrate_schema();
     $imported = db_users_import_legacy_credentials();
 
     db_users_initialize_credentials_cache( $created || $imported );
@@ -91,6 +98,8 @@ function db_users_ensure_table_exists() {
         '`user_login` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,' .
         '`user_pass` varchar(255) COLLATE utf8mb4_bin NOT NULL,' .
         '`user_role` varchar(20) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT \'user\',' .
+        '`email` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,' .
+        '`needs_password_reset` tinyint(1) NOT NULL DEFAULT 0,' .
         '`created_at` datetime NOT NULL,' .
         '`updated_at` datetime NOT NULL,' .
         'PRIMARY KEY (`id`),' .
@@ -104,6 +113,78 @@ function db_users_ensure_table_exists() {
     } catch ( \Exception $e ) {
         yourls_debug_log( 'db-users table creation failed: ' . $e->getMessage() );
         return false;
+    }
+}
+
+/**
+ * Migrate database schema to add new columns if they don't exist.
+ *
+ * @return bool True when migration SQL ran.
+ */
+function db_users_migrate_schema() {
+    $option_flag = (int) db_users_get_option( 'db_users_schema_migrated', 0 );
+    if( $option_flag === 1 ) {
+        return false;
+    }
+
+    $table = db_users_table_name();
+    $migrated = false;
+
+    try {
+        // Check if email column exists
+        $email_exists = db_users_db()->fetchValue(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS 
+             WHERE TABLE_SCHEMA = DATABASE() 
+             AND TABLE_NAME = :table 
+             AND COLUMN_NAME = 'email'",
+            [ 'table' => $table ]
+        );
+
+        if( !$email_exists ) {
+            db_users_db()->perform( "ALTER TABLE `$table` ADD COLUMN `email` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL" );
+            $migrated = true;
+        }
+
+        // Check if needs_password_reset column exists
+        $reset_exists = db_users_db()->fetchValue(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS 
+             WHERE TABLE_SCHEMA = DATABASE() 
+             AND TABLE_NAME = :table 
+             AND COLUMN_NAME = 'needs_password_reset'",
+            [ 'table' => $table ]
+        );
+
+        if( !$reset_exists ) {
+            db_users_db()->perform( "ALTER TABLE `$table` ADD COLUMN `needs_password_reset` tinyint(1) NOT NULL DEFAULT 0" );
+            $migrated = true;
+        }
+
+        if( $migrated ) {
+            db_users_set_option( 'db_users_schema_migrated', 1 );
+        }
+
+        return $migrated;
+    } catch ( \Exception $e ) {
+        // Fallback: try simpler ALTER TABLE without information_schema check
+        try {
+            db_users_db()->perform( "ALTER TABLE `$table` ADD COLUMN `email` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL" );
+            $migrated = true;
+        } catch ( \Exception $e2 ) {
+            // Column might already exist, ignore
+        }
+
+        try {
+            db_users_db()->perform( "ALTER TABLE `$table` ADD COLUMN `needs_password_reset` tinyint(1) NOT NULL DEFAULT 0" );
+            $migrated = true;
+        } catch ( \Exception $e3 ) {
+            // Column might already exist, ignore
+        }
+
+        if( $migrated ) {
+            db_users_set_option( 'db_users_schema_migrated', 1 );
+        }
+
+        return $migrated;
     }
 }
 
@@ -137,7 +218,8 @@ function db_users_import_legacy_credentials() {
 
                 $stored_password = db_users_normalize_password_storage( $password );
                 // Preserve current access level for existing users.
-                if( db_users_insert_user( $username, $stored_password, 'admin', $now ) ) {
+                // Legacy imports don't need password reset (they already have valid passwords)
+                if( db_users_insert_user( $username, $stored_password, 'admin', null, false, $now ) ) {
                     $imported = true;
                 }
             }
@@ -244,6 +326,7 @@ function db_users_handle_login() {
     }
 }
 
+
 /**
  * Register plugin admin pages (implemented later).
  *
@@ -251,21 +334,26 @@ function db_users_handle_login() {
  */
 function db_users_register_pages() {
     yourls_register_plugin_page( 'db_users', yourls__( 'User Accounts' ), 'db_users_render_admin_page' );
+    yourls_register_plugin_page( 'db_users_reset_password', yourls__( 'Reset Password' ), 'db_users_render_password_reset_page' );
 }
 
 /**
  * Insert a new user row.
  *
- * @param string $username        Username.
- * @param string $stored_password Stored password with prefix (phpass/md5/plain).
- * @param string $role            Role name.
- * @param string|null $timestamp  Optional timestamp to reuse for creation/update.
+ * @param string $username            Username.
+ * @param string $stored_password     Stored password with prefix (phpass/md5/plain).
+ * @param string $role                Role name.
+ * @param string|null $email          Optional email address.
+ * @param bool $needs_password_reset  Whether user needs to reset password (default true).
+ * @param string|null $timestamp      Optional timestamp to reuse for creation/update.
  * @return bool
  */
-function db_users_insert_user( $username, $stored_password, $role = 'user', $timestamp = null ) {
+function db_users_insert_user( $username, $stored_password, $role = 'user', $email = null, $needs_password_reset = true, $timestamp = null ) {
     $username        = db_users_sanitize_username( $username );
     $stored_password = (string) $stored_password;
     $role            = db_users_sanitize_role( $role );
+    $email           = $email ? db_users_sanitize_email( $email ) : null;
+    $needs_reset     = (bool) $needs_password_reset;
 
     if( $username === '' || $stored_password === '' ) {
         return false;
@@ -273,16 +361,18 @@ function db_users_insert_user( $username, $stored_password, $role = 'user', $tim
 
     $now = $timestamp ?: db_users_now();
 
-    $sql = "INSERT INTO `" . db_users_table_name() . "` (user_login, user_pass, user_role, created_at, updated_at)
-            VALUES (:login, :pass, :role, :created, :updated)";
+    $sql = "INSERT INTO `" . db_users_table_name() . "` (user_login, user_pass, user_role, email, needs_password_reset, created_at, updated_at)
+            VALUES (:login, :pass, :role, :email, :needs_reset, :created, :updated)";
 
     try {
         db_users_db()->fetchAffected( $sql, [
-            'login'   => $username,
-            'pass'    => $stored_password,
-            'role'    => $role,
-            'created' => $now,
-            'updated' => $now,
+            'login'       => $username,
+            'pass'        => $stored_password,
+            'role'        => $role,
+            'email'       => $email,
+            'needs_reset' => $needs_reset ? 1 : 0,
+            'created'     => $now,
+            'updated'     => $now,
         ] );
 
         return true;
@@ -298,9 +388,11 @@ function db_users_insert_user( $username, $stored_password, $role = 'user', $tim
  * @param string $username
  * @param string $password
  * @param string $role
+ * @param string|null $email
+ * @param bool $needs_password_reset
  * @return bool
  */
-function db_users_add_user( $username, $password, $role = 'user' ) {
+function db_users_add_user( $username, $password, $role = 'user', $email = null, $needs_password_reset = true ) {
     $username = db_users_sanitize_username( $username );
     $password = (string) $password;
 
@@ -310,7 +402,32 @@ function db_users_add_user( $username, $password, $role = 'user' ) {
 
     $stored = db_users_normalize_password_storage( $password );
 
-    return db_users_insert_user( $username, $stored, $role );
+    return db_users_insert_user( $username, $stored, $role, $email, $needs_password_reset );
+}
+
+/**
+ * Generate a secure temporary password.
+ *
+ * @param int $length Password length (default 16).
+ * @return string
+ */
+function db_users_generate_temp_password( $length = 16 ) {
+    // Generate a cryptographically secure random password
+    $characters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+    $password = '';
+    $max = strlen( $characters ) - 1;
+
+    // Use random_bytes for cryptographically secure randomness
+    for( $i = 0; $i < $length; $i++ ) {
+        if( function_exists( 'random_int' ) ) {
+            $password .= $characters[ random_int( 0, $max ) ];
+        } else {
+            // Fallback to mt_rand if random_int is not available
+            $password .= $characters[ mt_rand( 0, $max ) ];
+        }
+    }
+
+    return $password;
 }
 
 /**
@@ -444,12 +561,116 @@ function db_users_sanitize_role( $role ) {
 }
 
 /**
+ * Sanitize email address.
+ *
+ * @param string $email
+ * @return string
+ */
+function db_users_sanitize_email( $email ) {
+    $email = trim( (string) $email );
+    $email = filter_var( $email, FILTER_SANITIZE_EMAIL );
+
+    return $email;
+}
+
+/**
  * Provide the current timestamp string.
  *
  * @return string
  */
 function db_users_now() {
     return date( 'Y-m-d H:i:s' );
+}
+
+/**
+ * Load PHPMailer library.
+ *
+ * @return bool True if PHPMailer is available.
+ */
+function db_users_load_phpmailer() {
+    static $phpmailer_loaded = null;
+    
+    if( $phpmailer_loaded !== null ) {
+        return $phpmailer_loaded;
+    }
+    
+    $phpmailer_loaded = false;
+    
+    // Try to load from plugin directory first (most reliable)
+    $plugin_path = dirname( __FILE__ );
+    if( file_exists( $plugin_path . '/vendor/autoload.php' ) ) {
+        require_once $plugin_path . '/vendor/autoload.php';
+        if( class_exists( 'PHPMailer\PHPMailer\PHPMailer' ) ) {
+            $phpmailer_loaded = true;
+            return true;
+        }
+    }
+
+    // Try to load via Composer autoload from YOURLS root
+    if( file_exists( YOURLS_ABSPATH . '/vendor/autoload.php' ) ) {
+        require_once YOURLS_ABSPATH . '/vendor/autoload.php';
+        if( class_exists( 'PHPMailer\PHPMailer\PHPMailer' ) ) {
+            $phpmailer_loaded = true;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Send email using PHPMailer.
+ *
+ * @param string $to      Recipient email address.
+ * @param string $subject Email subject.
+ * @param string $body    Email body (plain text).
+ * @return bool True on success, false on failure.
+ */
+function db_users_send_email( $to, $subject, $body ) {
+    if( !db_users_load_phpmailer() ) {
+        yourls_debug_log( 'db-users: PHPMailer not available. Install via Composer: composer require phpmailer/phpmailer' );
+        return false;
+    }
+
+    // Get SMTP settings from YOURLS config
+    $smtp_host = defined( 'YOURLS_SMTP_HOST' ) ? YOURLS_SMTP_HOST : '';
+    $smtp_user = defined( 'YOURLS_SMTP_USER' ) ? YOURLS_SMTP_USER : '';
+    $smtp_pass = defined( 'YOURLS_SMTP_PASS' ) ? YOURLS_SMTP_PASS : '';
+    $smtp_port = defined( 'YOURLS_SMTP_PORT' ) ? YOURLS_SMTP_PORT : 587;
+
+    if( empty( $smtp_host ) || empty( $smtp_user ) || empty( $smtp_pass ) ) {
+        yourls_debug_log( 'db-users: SMTP settings not configured in config.php. Define YOURLS_SMTP_HOST, YOURLS_SMTP_USER, YOURLS_SMTP_PASS, and YOURLS_SMTP_PORT.' );
+        return false;
+    }
+
+    try {
+        $mail = new \PHPMailer\PHPMailer\PHPMailer( true );
+
+        // SMTP configuration
+        $mail->isSMTP();
+        $mail->Host       = $smtp_host;
+        $mail->SMTPAuth   = true;
+        $mail->Username   = $smtp_user;
+        $mail->Password   = $smtp_pass;
+        $mail->SMTPSecure = $smtp_port == 465 ? \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS : \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+        $mail->Port       = $smtp_port;
+        $mail->CharSet    = 'UTF-8';
+
+        // Email content
+        $from_email = defined( 'YOURLS_SMTP_FROM' ) ? YOURLS_SMTP_FROM : $smtp_user;
+        $from_name  = defined( 'YOURLS_SMTP_FROM_NAME' ) ? YOURLS_SMTP_FROM_NAME : 'YOURLS Admin';
+        $mail->setFrom( $from_email, $from_name );
+        $mail->addAddress( $to );
+        $mail->Subject = $subject;
+        $mail->Body    = $body;
+        $mail->isHTML( false );
+
+        $mail->send();
+        return true;
+    } catch ( \Exception $e ) {
+        yourls_debug_log( 'db-users: Email sending failed: ' . $e->getMessage() );
+        return false;
+    }
 }
 
 /**
@@ -491,6 +712,211 @@ function db_users_is_admin( $username = null ) {
 }
 
 /**
+ * Add CSS styles for password reset banner.
+ *
+ * @return void
+ */
+function db_users_add_banner_styles() {
+    // Only show on admin pages
+    if( !defined( 'YOURLS_USER' ) ) {
+        return;
+    }
+    
+    // Check if we're on the password reset page
+    $current_page = isset( $_GET['page'] ) ? $_GET['page'] : '';
+    $request_uri = isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '';
+    $is_reset_page = ( $current_page === 'db_users_reset_password' || strpos( $request_uri, 'page=db_users_reset_password' ) !== false );
+    
+    $current_user = db_users_get_user( YOURLS_USER );
+    if( $current_user && ( $current_user->needs_password_reset == 1 || $current_user->needs_password_reset === '1' ) ) {
+        echo '<style>
+        .db-users-password-reset-banner {
+            background: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 4px;
+            padding: 1.5em;
+            margin: 1em 0 2em;
+            color: #856404;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .db-users-password-reset-banner h3 {
+            margin-top: 0;
+            color: #856404;
+            font-size: 1.2em;
+        }
+        .db-users-password-reset-banner p {
+            margin: 0.5em 0;
+        }
+        .db-users-password-reset-banner .button-primary {
+            background: #ffc107;
+            border-color: #ff9800;
+            color: #000;
+            font-weight: bold;
+            padding: 0.5em 1.5em;
+            text-decoration: none;
+            display: inline-block;
+            border-radius: 3px;
+        }
+        .db-users-password-reset-banner .button-primary:hover {
+            background: #ff9800;
+            border-color: #f57c00;
+        }
+        </style>';
+    }
+}
+
+/**
+ * Display password reset banner on admin pages if user needs to reset.
+ *
+ * @return void
+ */
+function db_users_display_password_reset_banner() {
+    // Only show if user is logged in
+    if( !defined( 'YOURLS_USER' ) ) {
+        return;
+    }
+    
+    // Don't show banner on password reset page
+    $current_page = $_GET['page'] ?? '';
+    if( $current_page === 'db_users_reset_password' ) {
+        return;
+    }
+    
+    $current_user = db_users_get_user( YOURLS_USER );
+    // Only show banner if user actually needs to reset (needs_password_reset = 1)
+    if( $current_user && ( $current_user->needs_password_reset == 1 || $current_user->needs_password_reset === '1' ) ) {
+        $reset_url = yourls_admin_url( 'plugins.php?page=db_users_reset_password' );
+        echo '<div class="db-users-password-reset-banner">';
+        echo '<h3>' . yourls__( '⚠️ Password Reset Required' ) . '</h3>';
+        echo '<p style="font-size: 1.1em;"><strong>' . yourls__( 'You are using a temporary password. For your security, please reset it now.' ) . '</strong></p>';
+        echo '<p><a href="' . yourls_esc_attr( $reset_url ) . '" class="button button-primary">' . yourls__( 'Reset Password Now' ) . '</a></p>';
+        echo '</div>';
+    }
+}
+
+/**
+ * Render password reset page for first-time login.
+ *
+ * @return void
+ */
+function db_users_render_password_reset_page() {
+    // Check if user is logged in - if not, they shouldn't reach this page
+    if( !defined( 'YOURLS_USER' ) || YOURLS_USER === false ) {
+        // User not logged in - show message and link to login
+        echo '<div class="wrap">';
+        echo '<h2>' . yourls__( 'Reset Password' ) . '</h2>';
+        echo '<p>' . yourls__( 'You must be logged in to reset your password.' ) . '</p>';
+        echo '<p><a href="' . yourls_admin_url( 'index.php' ) . '" class="button">' . yourls__( 'Go to login' ) . '</a></p>';
+        echo '</div>';
+        return;
+    }
+
+    $messages = [];
+    $errors   = [];
+
+    // Handle password reset form submission
+    if( $_SERVER['REQUEST_METHOD'] === 'POST' && isset( $_POST['db_users_action'] ) && $_POST['db_users_action'] === 'reset_password' ) {
+        db_users_process_password_reset_action( $messages, $errors );
+        
+        // If reset was successful, the function will redirect
+        // If there were errors, we continue to show the form
+    }
+
+    $user = db_users_get_user( YOURLS_USER );
+    if( !$user ) {
+        echo '<p>' . yourls__( 'User not found.' ) . '</p>';
+        return;
+    }
+    
+    // Note: We don't redirect if they don't need reset - they can still access this page
+
+    echo '<h2>' . yourls__( 'Reset Your Password' ) . '</h2>';
+    echo '<style>
+    .db-users-form { max-width: 480px; margin: 2em auto; padding: 2em; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; }
+    .db-users-form p { margin: 0.8em 0; }
+    .db-users-warning { background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; padding: 1em; margin: 1em 0; color: #856404; }
+    </style>';
+
+    foreach( $errors as $error ) {
+        echo yourls_notice_box( yourls_esc_html( $error ), 'error' );
+    }
+
+    foreach( $messages as $message ) {
+        echo yourls_notice_box( yourls_esc_html( $message ), 'success' );
+    }
+
+    // echo '<div class="db-users-warning">';
+    // echo '<p><strong>' . yourls__( 'Password Reset Required' ) . '</strong></p>';
+    // echo '<p>' . yourls__( 'You must reset your password before you can access the admin area.' ) . '</p>';
+    // echo '</div>';
+
+    echo '<form method="post" class="db-users-form">';
+    echo '<input type="hidden" name="db_users_action" value="reset_password" />';
+    yourls_nonce_field( 'db_users_reset_password' );
+    echo '<p><label for="db-users-reset-current">' . yourls__( 'Current Password (Temporary)' ) . '</label><br />';
+    echo '<input type="password" class="text" id="db-users-reset-current" name="current_password" autocomplete="current-password" required /></p>';
+    echo '<p><label for="db-users-reset-new">' . yourls__( 'New Password' ) . '</label><br />';
+    echo '<input type="password" class="text" id="db-users-reset-new" name="new_password" autocomplete="new-password" required /></p>';
+    echo '<p><label for="db-users-reset-confirm">' . yourls__( 'Confirm New Password' ) . '</label><br />';
+    echo '<input type="password" class="text" id="db-users-reset-confirm" name="confirm_password" autocomplete="new-password" required /></p>';
+    echo '<p><button type="submit" class="button button-primary">' . yourls__( 'Reset Password' ) . '</button></p>';
+    echo '</form>';
+}
+
+/**
+ * Process password reset form submission.
+ *
+ * @param array $messages
+ * @param array $errors
+ * @return void
+ */
+function db_users_process_password_reset_action( array &$messages, array &$errors ) {
+    if( !defined( 'YOURLS_USER' ) ) {
+        $errors[] = yourls__( 'You must be logged in to reset your password.' );
+        return;
+    }
+
+    yourls_verify_nonce( 'db_users_reset_password' );
+
+    $username = YOURLS_USER;
+    $current  = (string) ( $_POST['current_password'] ?? '' );
+    $new      = trim( (string) ( $_POST['new_password'] ?? '' ) );
+    $confirm  = trim( (string) ( $_POST['confirm_password'] ?? '' ) );
+
+    if( $current === '' ) {
+        $errors[] = yourls__( 'Current password is required.' );
+        return;
+    }
+
+    if( $new === '' ) {
+        $errors[] = yourls__( 'New password is required.' );
+        return;
+    }
+
+    if( $new !== $confirm ) {
+        $errors[] = yourls__( 'New passwords do not match.' );
+        return;
+    }
+
+    if( !db_users_verify_password( $username, $current ) ) {
+        $errors[] = yourls__( 'Current password is incorrect.' );
+        return;
+    }
+
+    // Update password and clear needs_password_reset flag
+    if( db_users_update_user_password( $username, $new, true ) ) {
+        db_users_refresh_credentials_cache();
+        db_users_mark_password_reset_complete( $username );
+        yourls_store_cookie( $username );
+        // Redirect immediately to admin
+        yourls_redirect( yourls_admin_url(), 302 );
+        exit;
+    } else {
+        $errors[] = yourls__( 'Could not reset your password.' );
+    }
+}
+
+/**
  * Render plugin administration page.
  *
  * @return void
@@ -504,6 +930,19 @@ function db_users_render_admin_page() {
     $users = db_users_get_all_users();
 
     echo '<h2>' . yourls__( 'User Accounts' ) . '</h2>';
+    
+    // Show banner if current user needs to reset password
+    if( defined( 'YOURLS_USER' ) ) {
+        $current_user = db_users_get_user( YOURLS_USER );
+        if( $current_user && !empty( $current_user->needs_password_reset ) ) {
+            $reset_url = yourls_admin_url( 'plugins.php?page=db_users_reset_password' );
+            echo '<div style="background: #fff3cd; border: 2px solid #ffc107; border-radius: 4px; padding: 1.5em; margin: 1em 0 2em; color: #856404;">';
+            echo '<h3 style="margin-top: 0; color: #856404;">' . yourls__( '⚠️ Password Reset Required' ) . '</h3>';
+            echo '<p style="margin: 0.5em 0; font-size: 1.1em;"><strong>' . yourls__( 'You are using a temporary password. For your security, please reset it now.' ) . '</strong></p>';
+            echo '<p style="margin: 0.5em 0;"><a href="' . yourls_esc_attr( $reset_url ) . '" class="button button-primary" style="background: #ffc107; border-color: #ff9800; color: #000; font-weight: bold; padding: 0.5em 1.5em; text-decoration: none; display: inline-block;">' . yourls__( 'Reset Password Now' ) . '</a></p>';
+            echo '</div>';
+        }
+    }
     echo '<style>
     .db-users-form { max-width: 480px; margin: 0 0 1.5em; padding: 1em; border: 1px solid #d9d9d9; border-radius: 4px; background: #fff; }
     .db-users-form p { margin: 0.4em 0; }
@@ -592,8 +1031,7 @@ function db_users_process_create_user_action( array &$messages, array &$errors )
     yourls_verify_nonce( 'db_users_create_user' );
 
     $username = db_users_sanitize_username( $_POST['new_username'] ?? '' );
-    $password = trim( (string) ( $_POST['new_password'] ?? '' ) );
-    $confirm  = trim( (string) ( $_POST['confirm_password'] ?? '' ) );
+    $email    = db_users_sanitize_email( $_POST['new_email'] ?? '' );
     $role     = db_users_sanitize_role( $_POST['new_role'] ?? 'user' );
 
     if( $username === '' ) {
@@ -606,19 +1044,37 @@ function db_users_process_create_user_action( array &$messages, array &$errors )
         return;
     }
 
-    if( $password === '' ) {
-        $errors[] = yourls__( 'Password is required.' );
+    if( $email === '' || !filter_var( $email, FILTER_VALIDATE_EMAIL ) ) {
+        $errors[] = yourls__( 'A valid email address is required.' );
         return;
     }
 
-    if( $password !== $confirm ) {
-        $errors[] = yourls__( 'Passwords do not match.' );
-        return;
-    }
+    // Generate temporary password
+    $temp_password = db_users_generate_temp_password( 16 );
 
-    if( db_users_add_user( $username, $password, $role ) ) {
+    // Create user with temporary password and needs_password_reset flag
+    if( db_users_add_user( $username, $temp_password, $role, $email, true ) ) {
         db_users_refresh_credentials_cache();
-        $messages[] = sprintf( yourls__( 'User %s created.' ), $username );
+
+        // Send email with temporary password
+        $login_url = yourls_admin_url( 'index.php' );
+        $subject = sprintf( yourls__( 'Your YOURLS Account Credentials - %s' ), YOURLS_SITE );
+        $body = sprintf(
+            yourls__( "Hello,\n\nA new account has been created for you on %s.\n\nUsername: %s\nTemporary Password: %s\n\nPlease log in at: %s\n\nFor your security, you are strongly encouraged to reset your password after logging in.\n\nBest regards,\nYOURLS Admin" ),
+            YOURLS_SITE,
+            $username,
+            $temp_password,
+            $login_url
+        );
+
+        $email_sent = db_users_send_email( $email, $subject, $body );
+
+        if( $email_sent ) {
+            $messages[] = sprintf( yourls__( 'User %s created and temporary password sent to %s.' ), $username, $email );
+        } else {
+            $messages[] = sprintf( yourls__( 'User %s created, but email could not be sent. Temporary password: %s' ), $username, $temp_password );
+            yourls_debug_log( 'db-users: Failed to send email to ' . $email . ' for user ' . $username );
+        }
     } else {
         $errors[] = yourls__( 'Could not create user. Check logs for details.' );
     }
@@ -656,10 +1112,25 @@ function db_users_process_update_user_action( array &$messages, array &$errors )
         return;
     }
 
+    $new_email = db_users_sanitize_email( $_POST['new_email'] ?? '' );
     $new_role  = db_users_sanitize_role( $_POST['new_role'] ?? $user->user_role );
     $password  = trim( (string) ( $_POST['new_password'] ?? '' ) );
     $confirm   = trim( (string) ( $_POST['confirm_password'] ?? '' ) );
     $changed   = false;
+
+    $current_email = isset( $user->email ) ? $user->email : '';
+    if( $new_email !== $current_email ) {
+        if( $new_email !== '' && !filter_var( $new_email, FILTER_VALIDATE_EMAIL ) ) {
+            $errors[] = yourls__( 'Invalid email address.' );
+        } else {
+            if( db_users_update_email( $username, $new_email ) ) {
+                $messages[] = sprintf( yourls__( 'Email updated for %s.' ), $username );
+                $changed = true;
+            } else {
+                $errors[] = sprintf( yourls__( 'Could not update email for %s.' ), $username );
+            }
+        }
+    }
 
     if( $password !== '' ) {
         if( $password !== $confirm ) {
@@ -803,10 +1274,9 @@ function db_users_render_admin_create_form() {
     yourls_nonce_field( 'db_users_create_user' );
     echo '<p><label for="db-users-new-username">' . yourls__( 'Username' ) . '</label><br />';
     echo '<input type="text" class="text" id="db-users-new-username" name="new_username" required /></p>';
-    echo '<p><label for="db-users-new-password">' . yourls__( 'Password' ) . '</label><br />';
-    echo '<input type="password" class="text" id="db-users-new-password" name="new_password" autocomplete="new-password" required /></p>';
-    echo '<p><label for="db-users-new-confirm">' . yourls__( 'Confirm password' ) . '</label><br />';
-    echo '<input type="password" class="text" id="db-users-new-confirm" name="confirm_password" autocomplete="new-password" required /></p>';
+    echo '<p><label for="db-users-new-email">' . yourls__( 'Email' ) . '</label><br />';
+    echo '<input type="email" class="text" id="db-users-new-email" name="new_email" required /></p>';
+    echo '<p><small>' . yourls__( 'A temporary password will be generated and sent to this email address.' ) . '</small></p>';
     echo '<p><label for="db-users-new-role">' . yourls__( 'Role' ) . '</label><br />';
     echo '<select id="db-users-new-role" name="new_role">';
     echo '<option value="user">' . yourls__( 'User' ) . '</option>';
@@ -831,13 +1301,14 @@ function db_users_render_admin_users_list( array $users ) {
     }
 
     echo '<table class="db-users-table">';
-    echo '<thead><tr><th>' . yourls__( 'Username' ) . '</th><th>' . yourls__( 'Role' ) . '</th><th>' . yourls__( 'Last updated' ) . '</th></tr></thead>';
+    echo '<thead><tr><th>' . yourls__( 'Username' ) . '</th><th>' . yourls__( 'Email' ) . '</th><th>' . yourls__( 'Role' ) . '</th><th>' . yourls__( 'Last updated' ) . '</th></tr></thead>';
     echo '<tbody>';
 
     foreach( $users as $user ) {
         $raw_username  = $user->user_login;
         $display_name  = yourls_esc_html( $raw_username );
         $attr_username = yourls_esc_attr( $raw_username );
+        $user_email    = isset( $user->email ) ? yourls_esc_html( $user->email ) : '<em>' . yourls__( 'No email' ) . '</em>';
         $role_label    = $user->user_role === 'admin' ? yourls__( 'Administrator' ) : yourls__( 'User' );
         $unique_id     = 'db-users-edit-' . md5( $raw_username );
         $updated       = yourls_esc_html( $user->updated_at );
@@ -852,6 +1323,7 @@ function db_users_render_admin_users_list( array $users ) {
         } else {
             echo '<td><a href="#" class="db-users-toggle" data-target="' . $unique_id . '">' . $display_name . '</a></td>';
         }
+        echo '<td>' . $user_email . '</td>';
         echo '<td>' . yourls_esc_html( $role_label ) . '</td>';
         echo '<td>' . $updated . '</td>';
         echo '</tr>';
@@ -865,7 +1337,7 @@ function db_users_render_admin_users_list( array $users ) {
         $confirm_text    = yourls_esc_js( sprintf( yourls__( 'Delete user %s? This cannot be undone.' ), $raw_username ) );
 
         echo '<tr id="' . $unique_id . '" class="db-users-edit-row" style="display:none">';
-        echo '<td colspan="3">';
+        echo '<td colspan="4">';
         echo '<div class="db-users-edit-form">';
         echo '<div class="db-users-edit-header">';
         echo '<strong>' . sprintf( yourls__( 'Editing %s' ), $display_name ) . '</strong>';
@@ -885,6 +1357,9 @@ function db_users_render_admin_users_list( array $users ) {
         echo '<input type="hidden" name="db_users_action" value="update_user" />';
         echo '<input type="hidden" name="target_user" value="' . $attr_username . '" />';
         yourls_nonce_field( 'db_users_update_user' );
+        echo '<p><label>' . yourls__( 'Email' ) . '</label><br />';
+        $current_email = isset( $user->email ) ? yourls_esc_attr( $user->email ) : '';
+        echo '<input type="email" class="text" name="new_email" value="' . $current_email . '" /></p>';
         echo '<p><label>' . yourls__( 'Role' ) . '</label><br />';
         echo '<select name="new_role">';
         echo '<option value="admin" ' . $role_admin . '>' . yourls__( 'Administrator' ) . '</option>';
@@ -987,9 +1462,10 @@ function db_users_render_self_service_form() {
  *
  * @param string $username
  * @param string $password
+ * @param bool $clear_reset_flag Whether to clear needs_password_reset flag (default true).
  * @return bool
  */
-function db_users_update_user_password( $username, $password ) {
+function db_users_update_user_password( $username, $password, $clear_reset_flag = true ) {
     $username = db_users_sanitize_username( $username );
     $password = (string) $password;
 
@@ -999,9 +1475,57 @@ function db_users_update_user_password( $username, $password ) {
 
     $stored = db_users_normalize_password_storage( $password );
 
-    $sql = "UPDATE `" . db_users_table_name() . "` SET user_pass = :pass, updated_at = :updated WHERE user_login = :login";
+    $sql = "UPDATE `" . db_users_table_name() . "` SET user_pass = :pass, needs_password_reset = :needs_reset, updated_at = :updated WHERE user_login = :login";
     $affected = db_users_db()->fetchAffected( $sql, [
-        'pass'    => $stored,
+        'pass'        => $stored,
+        'needs_reset' => $clear_reset_flag ? 0 : 1,
+        'updated'     => db_users_now(),
+        'login'       => $username,
+    ] );
+
+    return $affected !== false;
+}
+
+/**
+ * Update a user's email address.
+ *
+ * @param string $username
+ * @param string $email
+ * @return bool
+ */
+function db_users_update_email( $username, $email ) {
+    $username = db_users_sanitize_username( $username );
+    $email    = $email ? db_users_sanitize_email( $email ) : null;
+
+    if( $username === '' ) {
+        return false;
+    }
+
+    $sql = "UPDATE `" . db_users_table_name() . "` SET email = :email, updated_at = :updated WHERE user_login = :login";
+    $affected = db_users_db()->fetchAffected( $sql, [
+        'email'   => $email,
+        'updated' => db_users_now(),
+        'login'   => $username,
+    ] );
+
+    return $affected !== false;
+}
+
+/**
+ * Mark that a user has completed password reset.
+ *
+ * @param string $username
+ * @return bool
+ */
+function db_users_mark_password_reset_complete( $username ) {
+    $username = db_users_sanitize_username( $username );
+
+    if( $username === '' ) {
+        return false;
+    }
+
+    $sql = "UPDATE `" . db_users_table_name() . "` SET needs_password_reset = 0, updated_at = :updated WHERE user_login = :login";
+    $affected = db_users_db()->fetchAffected( $sql, [
         'updated' => db_users_now(),
         'login'   => $username,
     ] );
@@ -1041,7 +1565,7 @@ function db_users_update_user_role( $username, $role ) {
  */
 function db_users_get_all_users() {
     $table = db_users_table_name();
-    $rows  = db_users_db()->fetchObjects( "SELECT user_login, user_role, created_at, updated_at FROM `$table` ORDER BY user_login ASC" );
+    $rows  = db_users_db()->fetchObjects( "SELECT user_login, user_role, email, needs_password_reset, created_at, updated_at FROM `$table` ORDER BY user_login ASC" );
 
     return $rows ? (array) $rows : [];
 }
@@ -1060,7 +1584,7 @@ function db_users_get_user( $username ) {
     }
 
     return db_users_db()->fetchObject(
-        "SELECT user_login, user_role, created_at, updated_at FROM `" . db_users_table_name() . "` WHERE user_login = :login LIMIT 1",
+        "SELECT user_login, user_role, email, needs_password_reset, created_at, updated_at FROM `" . db_users_table_name() . "` WHERE user_login = :login LIMIT 1",
         [ 'login' => $username ]
     );
 }
